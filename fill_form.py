@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import os
+import re
+import subprocess
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog
+
+# ======================================================================
+#   JSON HELPERS (with sanitization)
+# ======================================================================
+
+def sanitize_json_block(block: str) -> str:
+    """
+    Sanitizes JSON without breaking formatting.
+    - Removes ANSI sequences
+    - Removes illegal control chars
+    - Escapes newline or carriage return *inside* string literals
+    """
+
+    # Remove ANSI escape sequences
+    block = re.sub(r'\x1B[@-_][0-?]*[ -/]*[@-~]', '', block)
+
+    result = []
+    in_string = False
+    escape_next = False
+
+    for ch in block:
+        if escape_next:
+            # Just append escaped character literally
+            result.append(ch)
+            escape_next = False
+            continue
+
+        if ch == '\\':
+            result.append(ch)
+            escape_next = True
+            continue
+
+        # Detect string toggle
+        if ch == '"':
+            result.append(ch)
+            in_string = not in_string
+            continue
+
+        if in_string:
+            # Inside a string → escape forbidden chars
+            if ch == '\n':
+                result.append('\\n')
+                continue
+            if ch == '\r':
+                result.append('\\r')
+                continue
+            if ord(ch) < 32:
+                # Any other control char becomes a space
+                result.append(' ')
+                continue
+
+        else:
+            # Outside string → remove CR entirely, keep newlines
+            if ch == '\r':
+                continue
+            if ord(ch) < 32 and ch not in ['\n', '\t']:
+                continue
+
+        # Normal char
+        result.append(ch)
+
+    return ''.join(result)
+
+
+def collect_json_from_line_list(lines, start_index):
+    """
+    JSON collector:
+    - Scan forward until the FIRST line beginning with '{' (ignoring leading spaces)
+    - Perform brace-counting until the JSON object is complete.
+    - Sanitize control characters.
+    - Return parsed dict or None.
+    """
+    n = len(lines)
+    found_start = None
+    first_line = None
+
+    for j in range(start_index, n):
+        stripped = lines[j].lstrip()
+        if stripped.startswith("{"):
+            found_start = j
+            first_line = stripped
+            break
+
+    if found_start is None:
+        return None
+
+    brace_count = 0
+    collected = []
+    started = False
+
+    for j in range(found_start, n):
+        if j == found_start:
+            line = first_line
+        else:
+            line = lines[j]
+
+        collected.append(line)
+        brace_count += line.count("{")
+        brace_count -= line.count("}")
+
+        if "{" in line:
+            started = True
+
+        if started and brace_count == 0:
+            raw_block = "\n".join(collected)
+            sanitized = sanitize_json_block(raw_block)
+            try:
+                return json.loads(sanitized)
+            except Exception as e:
+                # Helpful debug, but non-fatal (caller will try other markers)
+                print("JSON parse error:", e)
+                print("Faulty sanitized block:")
+                print(sanitized[:400])
+                return None
+
+    return None
+
+
+def extract_json_after_marker(lines, marker, require_keys=None, first=True):
+    """
+    Find JSON immediately following a line containing `marker`.
+    Handles both:
+      line: ".... marker: { ... }"
+      line: ".... marker:" + next line "{"
+    If require_keys is given, JSON must contain all of those top-level keys.
+    `first=True` => return first match, otherwise last match.
+    """
+    indices = []
+    for i, line in enumerate(lines):
+        if marker in line:
+            indices.append(i)
+
+    if not indices:
+        return None
+
+    if not first:
+        indices = reversed(indices)
+
+    for i in indices:
+        line = lines[i]
+        if "{" in line:
+            # JSON starts on same line after the first '{'
+            brace_part = line[line.index("{") :]
+            block_lines = [brace_part] + lines[i + 1 :]
+            obj = collect_json_from_line_list(block_lines, 0)
+        else:
+            obj = collect_json_from_line_list(lines, i + 1)
+
+        if obj is None:
+            continue
+
+        if require_keys:
+            if not all(k in obj for k in require_keys):
+                continue
+
+        return obj
+
+    return None
+
+
+def json_contains_carrier_groups(obj) -> bool:
+    """Check if JSON contains 'carrierGroups' anywhere."""
+    if isinstance(obj, dict):
+        if "carrierGroups" in obj:
+            return True
+        return any(json_contains_carrier_groups(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(json_contains_carrier_groups(v) for v in obj)
+    return False
+
+
+# ======================================================================
+#   LOG PARSING (REQUEST / RESPONSE)
+# ======================================================================
+
+def parse_log_file(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+
+    lines = text.splitlines()
+
+    # -------------------------------
+    # REQUEST: strict priority order
+    # -------------------------------
+
+    request_json = None
+
+    # 1) Shopify
+    if request_json is None:
+        request_json = extract_json_after_marker(
+            lines,
+            "Converted shopify request to",
+            require_keys=["cart", "destination"],
+            first=True,
+        )
+
+    # 2) BigCommerce
+    if request_json is None:
+        request_json = extract_json_after_marker(
+            lines,
+            "Converted bigcommerce request to",
+            require_keys=["cart", "destination"],
+            first=True,
+        )
+
+    # 3) Magento 2 GraphQL
+    if request_json is None:
+        request_json = extract_json_after_marker(
+            lines,
+            "REST Request after GraphQL Unmarshalling",
+            require_keys=["cart"],
+            first=True,
+        )
+
+    # 4) Magento fallback [REQUEST]:
+    if request_json is None:
+        request_json = extract_json_after_marker(
+            lines,
+            "[REQUEST]:",
+            require_keys=["cart"],
+            first=True,
+        )
+
+    # 5) Generic converted request
+    if request_json is None:
+        for i, line in enumerate(lines):
+            if (
+                "Converted" in line
+                and "request to" in line
+                and "shopify" not in line.lower()
+                and "bigcommerce" not in line.lower()
+            ):
+                obj = None
+                if "{" in line:
+                    brace_part = line[line.index("{") :]
+                    block_lines = [brace_part] + lines[i + 1 :]
+                    obj = collect_json_from_line_list(block_lines, 0)
+                else:
+                    obj = collect_json_from_line_list(lines, i + 1)
+                if obj and "cart" in obj and "destination" in obj:
+                    request_json = obj
+                    break
+
+    if request_json is None:
+        raise ValueError("Could not extract request JSON from this log.")
+
+    # -------------------------------
+    # RESPONSE: strict priority order
+    # -------------------------------
+
+    response_json = None
+
+    # 1) Shopify adapted response
+    if response_json is None:
+        response_json = extract_json_after_marker(
+            lines,
+            "Adapting the following rate response to shopify response",
+            first=False,
+        )
+        if response_json and not json_contains_carrier_groups(response_json):
+            response_json = None
+
+    # 2) BigCommerce adapted response
+    if response_json is None:
+        response_json = extract_json_after_marker(
+            lines,
+            "Adapting the following rate response to bigcommerce response",
+            first=False,
+        )
+        if response_json and not json_contains_carrier_groups(response_json):
+            response_json = None
+
+    # 3) Magento 2 GraphQL response
+    if response_json is None:
+        response_json = extract_json_after_marker(
+            lines,
+            "REST Response before GraphQL Marshalling",
+            first=True,
+        )
+        if response_json and not json_contains_carrier_groups(response_json):
+            response_json = None
+
+    # 4) Magento fallback [RESPONSE]:
+    if response_json is None:
+        response_json = extract_json_after_marker(
+            lines,
+            "[RESPONSE]:",
+            first=True,
+        )
+        if response_json and not json_contains_carrier_groups(response_json):
+            response_json = None
+
+    # 5) Generic adapted response
+    if response_json is None:
+        for i, line in enumerate(lines):
+            if "Adapting the following rate response to" in line:
+                if "shopify response" in line.lower() or "bigcommerce response" in line.lower():
+                    continue
+                obj = None
+                if "{" in line:
+                    brace_part = line[line.index("{") :]
+                    block_lines = [brace_part] + lines[i + 1 :]
+                    obj = collect_json_from_line_list(block_lines, 0)
+                else:
+                    obj = collect_json_from_line_list(lines, i + 1)
+                if obj and json_contains_carrier_groups(obj):
+                    response_json = obj
+                    break
+
+    if response_json is None:
+        raise ValueError("Could not extract response JSON from this log.")
+
+    return extract_fields(request_json, response_json)
+
+
+# ======================================================================
+#   FIELD EXTRACTION
+# ======================================================================
+
+def extract_fields(request_json, response_json):
+    # Ship From
+    try:
+        ship_from = response_json["carrierGroups"][0]["carrierGroupDetail"]["originAddress"]
+    except Exception:
+        ship_from = {}
+
+    # Ship To
+    try:
+        ship_to = request_json["destination"]
+    except Exception:
+        ship_to = {}
+
+    # Cart
+    cart_items = []
+    try:
+        for item in request_json.get("cart", {}).get("items", []):
+            length = width = height = None
+            shipping_group = "N/A"
+            dim_group = "N/A"
+            for attr in item.get("attributes", []):
+                name = (attr.get("name") or "").lower()
+                # Attributes can be under "value" or "values"
+                vals = attr.get("values")
+                val = attr.get("value")
+                if vals and isinstance(vals, list):
+                    val = ", ".join(str(v) for v in vals if v is not None) or val
+
+                if name == "shipperhq_shipping_group":
+                    shipping_group = val or "N/A"
+                elif name == "shipperhq_dim_group":
+                    dim_group = val or "N/A"
+                elif name in ("ship_length", "shipperhq_length", "length"):
+                    length = val
+                elif name in ("ship_width", "shipperhq_width", "width"):
+                    width = val
+                elif name in ("ship_height", "shipperhq_height", "height"):
+                    height = val
+
+            if length and width and height:
+                dimensions = f"{length}x{width}x{height}"
+            else:
+                dimensions = "N/A"
+
+            cart_items.append({
+                "product": item.get("sku"),
+                "qty": item.get("qty"),
+                "weight": item.get("weight"),
+                "value": item.get("rowTotal"),
+                "shipping_group": shipping_group,
+                "dim_group": dim_group,
+                "dimensions": dimensions,
+            })
+    except Exception:
+        pass
+
+    # ============================
+    # METHODS + PER-CARRIER PACKING
+    # ============================
+
+    methods = []
+
+    def pick_shipments(*sources):
+        """Return the first non-empty shipments list from the provided dict sources."""
+        for src in sources:
+            if not isinstance(src, dict):
+                continue
+            ships = src.get("shipments")
+            if isinstance(ships, list) and ships:
+                return ships
+        return []
+
+    try:
+        for group in response_json.get("carrierGroups", []):
+            if not isinstance(group, dict):
+                continue
+
+            for carrier in group.get("carrierRates", []):
+                if not isinstance(carrier, dict):
+                    continue
+
+                carrier_name = (
+                    carrier.get("carrierName")
+                    or carrier.get("carrierTitle")
+                    or "Unknown Carrier"
+                )
+
+                # Build method entries
+                rates = carrier.get("rates") or []
+                for r in rates:
+                    if not isinstance(r, dict):
+                        continue
+
+                    # Extract address type
+                    address_type = None
+                    options = (r.get("selectedOptions") or {}).get("options") or []
+                    if isinstance(options, list) and options:
+                        address_type = options[0].get("value")
+
+                    shipments = pick_shipments(r, carrier)
+
+                    methods.append({
+                        "carrier": carrier_name,
+                        "service_name": r.get("name"),
+                        "base": r.get("origShippingPrice", r.get("totalCharges")),
+                        "final": r.get("shippingPrice"),
+                        "handling": r.get("handlingFee"),
+                        "negotiated": r.get("negotiatedRate", False),
+                        "address_type": address_type,
+                        "flat_rules": r.get("flatRulesApplied", []),
+                        "change_rules": r.get("changeRulesApplied", []),
+
+                        # NEW — packing per carrier (all shipments, not just first)
+                        "packing": shipments,
+                        "blocked_reasons": [],
+                        "error_message": "",
+                    })
+                # If no rates, capture blocking/prevent rules for visibility (BigCommerce case)
+                if not rates:
+                    prevent = carrier.get("preventRulesApplied") or []
+                    err = carrier.get("error") or {}
+                    err_msg = (
+                        err.get("internalErrorMessage")
+                        or err.get("externalErrorMessage")
+                        or ""
+                    )
+                    if prevent or err_msg:
+                        shipments = pick_shipments(carrier)
+                        methods.append({
+                            "carrier": carrier_name,
+                            "service_name": carrier.get("carrierTitle") or carrier_name,
+                            "base": None,
+                            "final": None,
+                            "handling": None,
+                            "negotiated": carrier.get("negotiatedRate", False),
+                            "address_type": None,
+                            "flat_rules": [],
+                            "change_rules": [],
+                            "packing": shipments,
+                            "blocked_reasons": prevent,
+                            "error_message": err_msg,
+                        })
+    except Exception as e:
+        print("Carrier extraction error:", e)
+
+    # No more "global packing"
+    return {
+        "Ship From": ship_from,
+        "Ship To": ship_to,
+        "Cart": cart_items,
+        "Methods": methods,
+    }
+
+
+# ======================================================================
+#   REPORT GENERATION
+# ======================================================================
+
+def build_table(headers, rows):
+    if not rows:
+        return "(no data)"
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, c in enumerate(r):
+            widths[i] = max(widths[i], len(str(c)))
+
+    header_line = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    separator = "-+-".join("-" * w for w in widths)
+    lines = [header_line, separator]
+
+    for r in rows:
+        lines.append(" | ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)))
+
+    return "\n".join(lines)
+
+
+def generate_report(summary):
+    sf = summary["Ship From"]
+    st = summary["Ship To"]
+
+    ship_from_line = f"{sf.get('street','')}, {sf.get('city','')}, {sf.get('region','')} {sf.get('zipcode','')}, {sf.get('country','')}"
+    ship_to_line = f"{st.get('street','')}, {st.get('city','')}, {st.get('region','')} {st.get('zipcode','')}, {st.get('country','')}"
+
+    # Cart
+    cart_rows = []
+    for item in summary["Cart"]:
+        cart_rows.append([
+            item.get("product", "N/A"),
+            item.get("qty", "N/A"),
+            item.get("weight", "N/A"),
+            item.get("dimensions", "N/A"),
+            item.get("value", "N/A"),
+            item.get("shipping_group", "N/A"),
+            item.get("dim_group", "N/A"),
+        ])
+    cart_table = build_table(
+        ["Product", "Qty", "Weight", "Dimensions", "Value", "Shipping Groups", "Packing Rules (shipperhq_dim_group)"],
+        cart_rows,
+    )
+
+    # Methods grouped by carrier, packing displayed once per carrier
+    carriers = {}
+    for m in summary["Methods"]:
+        name = m.get("carrier", "Unknown Carrier")
+        entry = carriers.setdefault(name, {"packing": [], "methods": []})
+        packing_list = m.get("packing") or []
+        if not entry["packing"] and packing_list:
+            entry["packing"] = packing_list
+        entry["methods"].append(m)
+
+    method_sections = []
+    for carrier_name, data in carriers.items():
+        carrier_methods = []
+        for m in data["methods"]:
+            base_val = m.get("base")
+            final_val = m.get("final")
+            handling_val = m.get("handling")
+            addr = m.get("address_type")
+            blocked = m.get("blocked_reasons") or []
+            err_msg = m.get("error_message") or ""
+
+            carrier_methods.append("\n".join([
+                f"Method: {carrier_name} – {m['service_name']}",
+                f"Base Rate: ${base_val}" if base_val not in (None, "") else "Base Rate: N/A",
+                f"Final Price Shown to Customer: ${final_val}" if final_val not in (None, "") else "Final Price Shown to Customer: N/A",
+                f"Handling Fee: ${handling_val}" if handling_val not in (None, "") else "Handling Fee: N/A",
+                f"Address Type: {addr if addr else 'N/A'}",
+                f"Rate Type: {'Negotiated' if m['negotiated'] else 'List'}",
+                f"Flat Rules Applied: {', '.join(m['flat_rules']) if m['flat_rules'] else 'None'}",
+                f"Change Rules Applied: {', '.join(m['change_rules']) if m['change_rules'] else 'None'}",
+                *(["Prevent/Block Reasons: " + "; ".join(blocked)] if blocked else []),
+                *(["Carrier Error: " + err_msg] if err_msg else []),
+            ]))
+
+        packings = data["packing"] if isinstance(data.get("packing"), list) else []
+        packing_lines = ["Packing:"]
+        if packings:
+            for idx, pack in enumerate(packings, 1):
+                dims = None
+                if pack.get("length") is not None and pack.get("width") is not None and pack.get("height") is not None:
+                    dims = f"{pack.get('length')}x{pack.get('width')}x{pack.get('height')}"
+
+                items = []
+                for bi in pack.get("boxedItems") or []:
+                    sku = bi.get("sku") or bi.get("itemId") or "item"
+                    qty = bi.get("qtyPacked")
+                    weight_packed = bi.get("weightPacked")
+                    item_bits = [sku]
+                    if qty not in (None, ""):
+                        item_bits.append(f"x{qty}")
+                    if weight_packed not in (None, ""):
+                        item_bits.append(f"{weight_packed} lb")
+                    items.append(" ".join(item_bits))
+
+                packing_lines.append(f"  Box {idx}:")
+                packing_lines.append(f"    Name: {pack.get('name', 'N/A')}")
+                packing_lines.append(f"    Weight: {pack.get('weight', 'N/A')}")
+                packing_lines.append(f"    Dimensions: {dims if dims else 'N/A'}")
+                if pack.get("freightClass"):
+                    packing_lines.append(f"    Freight Class: {pack.get('freightClass')}")
+                packing_lines.append("    Items: " + ("; ".join(items) if items else "N/A"))
+        else:
+            packing_lines.extend([
+                "  Box: N/A",
+                "  Weight: N/A",
+                "  Dimensions: N/A",
+            ])
+
+        method_sections.append("\n\n".join([
+            f"Carrier: {carrier_name}",
+            "\n\n".join(carrier_methods),
+            "\n".join(packing_lines),
+        ]))
+
+    methods_section = "\n\n".join(method_sections) if method_sections else "No carrier services returned."
+
+    return f"""
+=== Ship From ===
+{ship_from_line}
+
+=== Ship To ===
+{ship_to_line}
+
+=== Cart Contents ===
+{cart_table}
+
+=== Carrier & Service Returned (Per Method) ===
+{methods_section}
+""".strip()
+
+
+# ======================================================================
+#   FILE PICKER
+# ======================================================================
+
+def pick_file():
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.askopenfilename(
+        title="Select Log File",
+        filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")]
+    )
+
+
+def find_latest_shipperws_log(base_dir, token):
+    """Find the newest shipperws log containing the token; prefer *.shipperws.log."""
+    logs_root = os.path.join(base_dir, "logs")
+    preferred = []
+    fallback = []
+
+    for root, _, files in os.walk(logs_root):
+        for name in files:
+            if token not in name or "shipperws" not in name or not name.endswith(".log"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if name.endswith(".shipperws.log"):
+                preferred.append((mtime, path))
+            else:
+                fallback.append((mtime, path))
+
+    for bucket in (preferred, fallback):
+        if bucket:
+            bucket.sort(key=lambda t: t[0], reverse=True)
+            return bucket[0][1]
+    return None
+
+
+# ======================================================================
+#   MAIN
+# ======================================================================
+
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = None
+
+    # support drag-and-drop (argv) or file picker
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        # If a file path was provided directly, use it
+        if os.path.isfile(arg):
+            log_path = arg
+        else:
+            # Treat arg as transaction/token, run findlog.sh, then pick newest shipperws log
+            tid = arg
+            findlog_path = os.path.join(script_dir, "findlog.sh")
+            if not os.path.isfile(findlog_path):
+                print(f"Cannot find findlog.sh at {findlog_path}")
+                sys.exit(1)
+
+            print(f"Fetching logs via findlog.sh for {tid} ...")
+            try:
+                subprocess.run([findlog_path, tid], cwd=script_dir, check=True)
+            except subprocess.CalledProcessError as e:
+                print("findlog.sh failed with code", e.returncode)
+                sys.exit(e.returncode)
+
+            log_path = find_latest_shipperws_log(script_dir, tid)
+            if not log_path:
+                print(f"No shipperws log found for token '{tid}' under logs/.")
+                sys.exit(1)
+            print(f"Using latest shipperws log: {log_path}")
+    else:
+        print("Please select your log file...")
+        log_path = pick_file()
+
+    if not log_path:
+        print("No file selected.")
+        sys.exit(0)
+
+    print(f"Processing: {log_path}")
+
+    try:
+        summary = parse_log_file(log_path)
+        report = generate_report(summary)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(
+            os.path.dirname(log_path),
+            f"rate_analysis_{ts}.txt"
+        )
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(report)
+
+        print(f"Saved to: {out_path}")
+
+    except Exception as e:
+        print("\nERROR:", e)
+        sys.exit(1)
