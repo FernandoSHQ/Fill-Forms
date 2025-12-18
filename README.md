@@ -2,13 +2,28 @@
 
 This repo contains the `fill_form.py` tool we use to gather shipment/package details and rates from ShipperHQ logs to complete the First Touch Rate Discrepancy form.
 
-## Quick start
+## Quick start (support agents)
 
-```bash
-git clone https://github.com/FernandoSHQ/Fill-Forms.git
-cd Fill-Forms
-pip install -r requirements.txt   # if you need any deps; skip if already set up
-```
+1) Pick or create a folder to hold the tool (anywhere is fine), then clone the repo:
+   ```bash
+   git clone https://github.com/FernandoSHQ/Fill-Forms.git
+   cd Fill-Forms
+   ```
+2) Install deps if needed:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3) Link `findlog.sh` from the ops-tools repo (so `fill_form.py` can auto-fetch logs by transaction ID). From inside your ops-tools directory run:
+   ```bash
+   ln -s "$(pwd)/findlog.sh" /path/to/Fill-Forms/findlog.sh
+   chmod +x "$(pwd)/findlog.sh"
+   ```
+   Replace `/path/to/Fill-Forms` with where you cloned this repo.
+4) (Optional) Add this folder to your PATH so you can run `fill_form.py` from anywhere:
+   ```bash
+   echo 'export PATH="/path/to/Fill-Forms:$PATH"' >> ~/.zshrc
+   source ~/.zshrc
+   ```
 
 ## Running the tool
 
@@ -20,6 +35,12 @@ python3 fill_form.py /path/to/shipperws_or_carrierws.log
 If you run it with no arguments, it will pop a file picker so you can select a log.
 
 Output: a `rate_analysis_<timestamp>.txt` is written next to the log file you processed. This text file has the ship-from/ship-to, cart items, returned carrier services, and the per-box packing list you need for the First Touch Rate Discrepancy form.
+
+To update the tool later (grab latest fixes):
+```bash
+cd /path/to/Fill-Forms
+git pull
+```
 
 ## Notes
 
