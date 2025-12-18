@@ -4,22 +4,29 @@ This repo contains the `fill_form.py` tool we use to gather shipment/package det
 
 ## Quick start (support agents)
 
-1) Pick or create a folder to hold the tool (anywhere is fine), then clone the repo:
+1) Install/check Python 3:
+   ```bash
+   python3 --version   # should print 3.x
+   ```
+   If it’s missing, install Python 3 from python.org or your package manager, then rerun the version check.
+
+2) Pick or create a folder to hold the tool (anywhere is fine), then clone the repo:
    ```bash
    git clone https://github.com/FernandoSHQ/Fill-Forms.git
-   cd /path/to/Fill-Forms > Navigate into the folder you created
+   cd /path/to/Fill-Forms   # replace with where you cloned
    ```
-2) Install deps if needed:
+3) Install deps if needed:
    ```bash
    pip install -r requirements.txt
    ```
-3) Navigate back into the ops-tools directory. Link `findlog.sh` from the ops-tools repo (so `fill_form.py` can auto-fetch logs by transaction ID). From inside your ops-tools directory run:
+4) From the ops-tools directory, link `findlog.sh` (so `fill_form.py` can auto-fetch logs by transaction ID):
    ```bash
+   cd /path/to/ops-tools           # the folder that has findlog.sh
    ln -s "$(pwd)/findlog.sh" /path/to/Fill-Forms/findlog.sh
    chmod +x "$(pwd)/findlog.sh"
    ```
-   Replace `/path/to/Fill-Forms` with where you cloned the repo in step 1.
-4) Add this folder to your PATH so you can run `fill_form.py` from anywhere:
+   Replace `/path/to/Fill-Forms` with where you cloned in step 2.
+5) (Optional) Add the Fill-Forms folder to your PATH so you can run `fill_form.py` from anywhere:
    ```bash
    echo 'export PATH="/path/to/Fill-Forms:$PATH"' >> ~/.zshrc
    source ~/.zshrc
