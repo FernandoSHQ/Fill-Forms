@@ -13,6 +13,88 @@ from tkinter import filedialog
 #   JSON HELPERS (with sanitization)
 # ======================================================================
 
+# Matches interleaved log-framework lines that the server injects mid-JSON.
+# Example:
+#   2025-12-11 20:42:10.908 shq-app-shipperws/auto-deploy-app DEBUG 1 --- [...] com.shq.ws: ...
+_INTERLEAVED_LOG_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} '
+)
+
+
+def strip_interleaved_log_noise(lines):
+    """
+    Pre-process a list of lines to remove interleaved log-framework noise.
+
+    ShipperHQ logs can inject timestamped debug lines (and their multi-line
+    Java toString() continuations) right in the middle of a JSON payload.
+    This function strips those noise lines and, when the noise causes JSON
+    truncation (open braces never closed), auto-closes them so the result
+    can be parsed as valid JSON.
+
+    Returns a new list of cleaned lines.
+    """
+    noise_mode = False
+    cleaned = []
+    # Stack tracks open JSON braces/brackets: '{' or '['
+    stack = []
+
+    for line in lines:
+        stripped = line.lstrip()
+
+        # Detect timestamp-prefixed log lines
+        if _INTERLEAVED_LOG_RE.match(stripped):
+            noise_mode = True
+            continue
+
+        if noise_mode:
+            if not stripped:
+                # Empty line inside a noise block — skip
+                continue
+            if stripped.startswith('"'):
+                # A JSON key line — noise is over, JSON content resumes
+                noise_mode = False
+                cleaned.append(line)
+                for ch in line:
+                    if ch == '{':
+                        stack.append('{')
+                    elif ch == '[':
+                        stack.append('[')
+                    elif ch == '}' and stack and stack[-1] == '{':
+                        stack.pop()
+                    elif ch == ']' and stack and stack[-1] == '[':
+                        stack.pop()
+            # else: Java toString continuation or ambiguous — skip
+            continue
+
+        # Normal (non-noise) line
+        cleaned.append(line)
+        for ch in line:
+            if ch == '{':
+                stack.append('{')
+            elif ch == '[':
+                stack.append('[')
+            elif ch == '}' and stack and stack[-1] == '{':
+                stack.pop()
+            elif ch == ']' and stack and stack[-1] == '[':
+                stack.pop()
+
+    # If noise stripping left unclosed braces/brackets, auto-close them
+    # so the JSON is still parseable (the truncated fields will just be empty).
+    if stack:
+        # Remove trailing comma on the last real line if present
+        while cleaned and not cleaned[-1].strip():
+            cleaned.pop()
+        if cleaned:
+            last = cleaned[-1].rstrip()
+            if last.endswith(','):
+                cleaned[-1] = last[:-1]
+
+        while stack:
+            item = stack.pop()
+            cleaned.append('}' if item == '{' else ']')
+
+    return cleaned
+
 def sanitize_json_block(block: str) -> str:
     """
     Sanitizes JSON without breaking formatting.
@@ -75,17 +157,21 @@ def sanitize_json_block(block: str) -> str:
 def collect_json_from_line_list(lines, start_index):
     """
     JSON collector:
-    - Scan forward until the FIRST line beginning with '{' (ignoring leading spaces)
+    - Pre-process lines to strip interleaved log-framework noise.
+    - Scan forward until the FIRST line beginning with '{' (ignoring leading spaces).
     - Perform brace-counting until the JSON object is complete.
     - Sanitize control characters.
     - Return parsed dict or None.
     """
-    n = len(lines)
+    # Pre-clean lines from start_index onward to strip interleaved noise
+    cleaned_lines = strip_interleaved_log_noise(lines[start_index:])
+
+    n = len(cleaned_lines)
     found_start = None
     first_line = None
 
-    for j in range(start_index, n):
-        stripped = lines[j].lstrip()
+    for j in range(n):
+        stripped = cleaned_lines[j].lstrip()
         if stripped.startswith("{"):
             found_start = j
             first_line = stripped
@@ -102,7 +188,7 @@ def collect_json_from_line_list(lines, start_index):
         if j == found_start:
             line = first_line
         else:
-            line = lines[j]
+            line = cleaned_lines[j]
 
         collected.append(line)
         brace_count += line.count("{")
@@ -320,7 +406,17 @@ def parse_log_file(path):
     if response_json is None:
         raise ValueError("Could not extract response JSON from this log.")
 
-    return extract_fields(request_json, response_json)
+    # -------------------------------
+    # PLATFORM IDENTIFICATION
+    # -------------------------------
+    platform = "Unknown"
+    site = request_json.get("siteDetails")
+    if isinstance(site, dict):
+        platform = site.get("ecommerceCart") or "Unknown"
+
+    result = extract_fields(request_json, response_json)
+    result["Platform"] = platform
+    return result
 
 
 # ======================================================================
@@ -342,37 +438,57 @@ def extract_fields(request_json, response_json):
 
     # Cart
     cart_items = []
+
+    def _extract_item_attrs(item):
+        """Pull dimensions, shipping group, and packing rules from an item's attributes."""
+        length = width = height = None
+        shipping_group = "N/A"
+        dim_group = "N/A"
+        for attr in item.get("attributes", []):
+            name = (attr.get("name") or "").lower()
+            vals = attr.get("values")
+            val = attr.get("value")
+            if vals and isinstance(vals, list):
+                val = ", ".join(str(v) for v in vals if v is not None) or val
+
+            if name == "shipperhq_shipping_group":
+                shipping_group = val or "N/A"
+            elif name == "shipperhq_dim_group":
+                dim_group = val or "N/A"
+            elif name in ("ship_length", "shipperhq_length", "length"):
+                length = val
+            elif name in ("ship_width", "shipperhq_width", "width"):
+                width = val
+            elif name in ("ship_height", "shipperhq_height", "height"):
+                height = val
+
+        dimensions = f"{length}x{width}x{height}" if length and width and height else "N/A"
+        return shipping_group, dim_group, dimensions
+
     try:
         for item in request_json.get("cart", {}).get("items", []):
-            length = width = height = None
-            shipping_group = "N/A"
-            dim_group = "N/A"
-            for attr in item.get("attributes", []):
-                name = (attr.get("name") or "").lower()
-                # Attributes can be under "value" or "values"
-                vals = attr.get("values")
-                val = attr.get("value")
-                if vals and isinstance(vals, list):
-                    val = ", ".join(str(v) for v in vals if v is not None) or val
+            shipping_group, dim_group, dimensions = _extract_item_attrs(item)
 
-                if name == "shipperhq_shipping_group":
-                    shipping_group = val or "N/A"
-                elif name == "shipperhq_dim_group":
-                    dim_group = val or "N/A"
-                elif name in ("ship_length", "shipperhq_length", "length"):
-                    length = val
-                elif name in ("ship_width", "shipperhq_width", "width"):
-                    width = val
-                elif name in ("ship_height", "shipperhq_height", "height"):
-                    height = val
+            # Magento configurable/bundle items carry child items[].
+            # Check children for attributes that may be missing on the parent.
+            children = item.get("items") or []
+            if children and isinstance(children, list):
+                for child in children:
+                    sg, dg, dims = _extract_item_attrs(child)
+                    if shipping_group == "N/A" and sg != "N/A":
+                        shipping_group = sg
+                    if dim_group == "N/A" and dg != "N/A":
+                        dim_group = dg
+                    if dimensions == "N/A" and dims != "N/A":
+                        dimensions = dims
 
-            if length and width and height:
-                dimensions = f"{length}x{width}x{height}"
-            else:
-                dimensions = "N/A"
+            item_type = item.get("type", "")
+            sku = item.get("sku")
+            if item_type in ("configurable", "bundle") and sku:
+                sku = f"{sku} ({item_type})"
 
             cart_items.append({
-                "product": item.get("sku"),
+                "product": sku,
                 "qty": item.get("qty"),
                 "weight": item.get("weight"),
                 "value": item.get("rowTotal"),
@@ -408,11 +524,16 @@ def extract_fields(request_json, response_json):
                 if not isinstance(carrier, dict):
                     continue
 
+                is_shared = (carrier.get("carrierType") or "").lower() == "shqshared"
+
                 carrier_name = (
                     carrier.get("carrierName")
                     or carrier.get("carrierTitle")
+                    or carrier.get("carrierCode")
                     or "Unknown Carrier"
                 )
+                carrier_code = carrier.get("carrierCode") or "N/A"
+                carrier_type = carrier.get("carrierType") or "N/A"
 
                 # Build method entries
                 rates = carrier.get("rates") or []
@@ -420,16 +541,43 @@ def extract_fields(request_json, response_json):
                     if not isinstance(r, dict):
                         continue
 
+                    # For shared carriers, each rate carries its own real
+                    # carrier identity (carrierCode, carrierType, carrierTitle).
+                    if is_shared:
+                        rate_carrier_name = (
+                            r.get("carrierTitle")
+                            or r.get("carrierCode")
+                            or carrier_name
+                        )
+                        rate_carrier_code = r.get("carrierCode") or carrier_code
+                        rate_carrier_type = r.get("carrierType") or carrier_type
+                    else:
+                        rate_carrier_name = carrier_name
+                        rate_carrier_code = carrier_code
+                        rate_carrier_type = carrier_type
+
                     # Extract address type
                     address_type = None
                     options = (r.get("selectedOptions") or {}).get("options") or []
                     if isinstance(options, list) and options:
                         address_type = options[0].get("value")
 
-                    shipments = pick_shipments(r, carrier)
+                    # For shared carriers, prefer packing from rateBreakdownList
+                    # which contains the actual per-carrier shipment details.
+                    shipments = []
+                    if is_shared:
+                        for bd in r.get("rateBreakdownList") or []:
+                            if isinstance(bd, dict):
+                                shipments = pick_shipments(bd)
+                                if shipments:
+                                    break
+                    if not shipments:
+                        shipments = pick_shipments(r, carrier)
 
                     methods.append({
-                        "carrier": carrier_name,
+                        "carrier": rate_carrier_name,
+                        "carrier_code": rate_carrier_code,
+                        "carrier_type": rate_carrier_type,
                         "service_name": r.get("name"),
                         "base": r.get("origShippingPrice", r.get("totalCharges")),
                         "final": r.get("shippingPrice"),
@@ -439,7 +587,7 @@ def extract_fields(request_json, response_json):
                         "flat_rules": r.get("flatRulesApplied", []),
                         "change_rules": r.get("changeRulesApplied", []),
 
-                        # NEW — packing per carrier (all shipments, not just first)
+                        # Packing per carrier (all shipments, not just first)
                         "packing": shipments,
                         "blocked_reasons": [],
                         "error_message": "",
@@ -457,6 +605,8 @@ def extract_fields(request_json, response_json):
                         shipments = pick_shipments(carrier)
                         methods.append({
                             "carrier": carrier_name,
+                            "carrier_code": carrier_code,
+                            "carrier_type": carrier_type,
                             "service_name": carrier.get("carrierTitle") or carrier_name,
                             "base": None,
                             "final": None,
@@ -532,10 +682,14 @@ def generate_report(summary):
     carriers = {}
     for m in summary["Methods"]:
         name = m.get("carrier", "Unknown Carrier")
-        entry = carriers.setdefault(name, {"packing": [], "methods": []})
+        entry = carriers.setdefault(name, {"packing": [], "methods": [], "carrier_code": "N/A", "carrier_type": "N/A"})
         packing_list = m.get("packing") or []
         if not entry["packing"] and packing_list:
             entry["packing"] = packing_list
+        if entry["carrier_code"] == "N/A" and m.get("carrier_code", "N/A") != "N/A":
+            entry["carrier_code"] = m["carrier_code"]
+        if entry["carrier_type"] == "N/A" and m.get("carrier_type", "N/A") != "N/A":
+            entry["carrier_type"] = m["carrier_type"]
         entry["methods"].append(m)
 
     method_sections = []
@@ -597,14 +751,19 @@ def generate_report(summary):
             ])
 
         method_sections.append("\n\n".join([
-            f"Carrier: {carrier_name}",
+            f"Carrier: {carrier_name}  (code: {data['carrier_code']}, type: {data['carrier_type']})",
             "\n\n".join(carrier_methods),
             "\n".join(packing_lines),
         ]))
 
     methods_section = "\n\n".join(method_sections) if method_sections else "No carrier services returned."
 
+    platform = summary.get("Platform", "Unknown")
+
     return f"""
+=== Platform ===
+{platform}
+
 === Ship From ===
 {ship_from_line}
 
@@ -683,7 +842,7 @@ if __name__ == "__main__":
 
             print(f"Fetching logs via findlog.sh for {tid} ...")
             try:
-                subprocess.run([findlog_path, tid], cwd=script_dir, check=True)
+                subprocess.run([findlog_path, tid, "-x"], cwd=script_dir, check=True)
             except subprocess.CalledProcessError as e:
                 print("findlog.sh failed with code", e.returncode)
                 sys.exit(e.returncode)
@@ -716,6 +875,7 @@ if __name__ == "__main__":
             f.write(report)
 
         print(f"Saved to: {out_path}")
+        subprocess.Popen(["open", out_path])
 
     except Exception as e:
         print("\nERROR:", e)
